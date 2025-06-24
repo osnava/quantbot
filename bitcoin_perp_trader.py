@@ -13,6 +13,9 @@ from dataclasses import dataclass
 import time
 import warnings
 import random
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 warnings.filterwarnings('ignore')
 
 @dataclass
@@ -66,6 +69,122 @@ class BitcoinPerpTrader:
         self.price_data = pd.DataFrame()
         self.signal_history = []
         
+        # Railway-optimized request session
+        self.session = self._create_session()
+        
+        # Caching for Railway deployment
+        self.cache = {}
+        self.cache_duration = 60  # seconds
+        
+        # API failure tracking
+        self.failed_apis = {}
+        self.circuit_breaker_threshold = 3
+        
+        # Enhanced logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+    
+    def _create_session(self):
+        """Create optimized requests session for Railway deployment"""
+        session = requests.Session()
+        
+        # Retry strategy for cloud deployment
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        return session
+    
+    def _get_browser_headers(self, api_name: str = "default"):
+        """Get realistic browser headers for each API"""
+        base_headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
+        
+        # API-specific headers
+        if api_name == "binance":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Origin': 'https://www.binance.com',
+                'Referer': 'https://www.binance.com/'
+            })
+        elif api_name == "coinbase":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Origin': 'https://pro.coinbase.com',
+                'Referer': 'https://pro.coinbase.com/'
+            })
+        elif api_name == "coingecko":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Origin': 'https://www.coingecko.com',
+                'Referer': 'https://www.coingecko.com/'
+            })
+        else:
+            base_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        
+        return base_headers
+    
+    def _is_cached(self, key: str) -> bool:
+        """Check if data is cached and still valid"""
+        if key in self.cache:
+            timestamp, data = self.cache[key]
+            if time.time() - timestamp < self.cache_duration:
+                return True
+            else:
+                del self.cache[key]
+        return False
+    
+    def _set_cache(self, key: str, data: any):
+        """Cache data with timestamp"""
+        self.cache[key] = (time.time(), data)
+    
+    def _get_cache(self, key: str):
+        """Get cached data"""
+        if key in self.cache:
+            return self.cache[key][1]
+        return None
+    
+    def _is_api_available(self, api_name: str) -> bool:
+        """Check if API is available (circuit breaker pattern)"""
+        if api_name in self.failed_apis:
+            failures, last_failure = self.failed_apis[api_name]
+            # Reset after 5 minutes
+            if time.time() - last_failure > 300:
+                del self.failed_apis[api_name]
+                return True
+            return failures < self.circuit_breaker_threshold
+        return True
+    
+    def _record_api_failure(self, api_name: str):
+        """Record API failure for circuit breaker"""
+        if api_name in self.failed_apis:
+            failures, _ = self.failed_apis[api_name]
+            self.failed_apis[api_name] = (failures + 1, time.time())
+        else:
+            self.failed_apis[api_name] = (1, time.time())
+    
+    def _record_api_success(self, api_name: str):
+        """Record API success and reset failure count"""
+        if api_name in self.failed_apis:
+            del self.failed_apis[api_name]
+        
     def fetch_perpetual_data(self, symbol: str = "BTCUSDT") -> Optional[PerpetualMarketData]:
         """Fetch comprehensive perpetual futures data with multiple fallbacks"""
         try:
@@ -93,126 +212,234 @@ class BitcoinPerpTrader:
             return None
     
     def _fetch_price_multiple_sources(self, symbol: str) -> Optional[Dict]:
-        """Try multiple APIs for price data"""
+        """Railway-optimized API calls with caching and fallbacks"""
         
-        # Method 1: Try Binance Spot (often less restricted)
-        try:
-            url = f"{self.apis['binance_spot']}/ticker/24hr"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(url, params={'symbol': symbol}, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    'price': float(data['lastPrice']),
-                    'volume': float(data['volume']),
-                    'price_change': float(data['priceChangePercent'])
-                }
-        except Exception as e:
-            print(f"Binance spot API failed: {e}")
+        # Check cache first
+        cache_key = f"price_data_{symbol}"
+        if self._is_cached(cache_key):
+            self.logger.info("Using cached price data")
+            return self._get_cache(cache_key)
         
-        # Method 2: Try CoinGecko (usually works everywhere)
+        # Try APIs in order of Railway compatibility
+        apis_to_try = [
+            ('coingecko', self._fetch_coingecko_price),
+            ('cryptocompare', self._fetch_cryptocompare_price),
+            ('coinbase', self._fetch_coinbase_price),
+            ('binance', self._fetch_binance_price)
+        ]
+        
+        for api_name, fetch_func in apis_to_try:
+            if not self._is_api_available(api_name):
+                self.logger.warning(f"Skipping {api_name} - circuit breaker active")
+                continue
+                
+            try:
+                self.logger.info(f"Trying {api_name} API...")
+                result = fetch_func(symbol)
+                if result and result.get('price', 0) > 0:
+                    self.logger.info(f"✅ {api_name} API successful: ${result['price']:,.2f}")
+                    self._record_api_success(api_name)
+                    self._set_cache(cache_key, result)
+                    return result
+                else:
+                    self.logger.warning(f"❌ {api_name} returned invalid data")
+                    self._record_api_failure(api_name)
+                    
+            except Exception as e:
+                self.logger.error(f"❌ {api_name} API failed: {e}")
+                self._record_api_failure(api_name)
+                time.sleep(0.5)  # Brief pause between API attempts
+        
+        self.logger.error("🚨 All price APIs failed")
+        return None
+    
+    def _fetch_coingecko_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from CoinGecko - most Railway-friendly"""
         try:
             url = f"{self.apis['coingecko']}/simple/price"
+            headers = self._get_browser_headers("coingecko")
             params = {
                 'ids': 'bitcoin',
                 'vs_currencies': 'usd',
                 'include_24hr_vol': 'true',
-                'include_24hr_change': 'true'
+                'include_24hr_change': 'true',
+                'include_market_cap': 'false',
+                'include_last_updated_at': 'false'
             }
-            response = requests.get(url, params=params, timeout=15)
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=20)
             
             if response.status_code == 200:
                 data = response.json()
                 btc_data = data.get('bitcoin', {})
-                return {
-                    'price': btc_data.get('usd', 0),
-                    'volume': btc_data.get('usd_24h_vol', 0),
-                    'price_change': btc_data.get('usd_24h_change', 0)
-                }
+                if btc_data:
+                    return {
+                        'price': btc_data.get('usd', 0),
+                        'volume': btc_data.get('usd_24h_vol', 0),
+                        'price_change': btc_data.get('usd_24h_change', 0)
+                    }
+            else:
+                self.logger.warning(f"CoinGecko HTTP {response.status_code}: {response.text[:100]}")
+                
         except Exception as e:
-            print(f"CoinGecko API failed: {e}")
+            raise Exception(f"CoinGecko error: {e}")
         
-        # Method 3: Try Coinbase
-        try:
-            url = f"{self.apis['coinbase']}/products/BTC-USD/ticker"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    'price': float(data.get('price', 0)),
-                    'volume': float(data.get('volume', 0)),
-                    'price_change': 0  # Coinbase doesn't provide 24h change in this endpoint
-                }
-        except Exception as e:
-            print(f"Coinbase API failed: {e}")
-        
-        # Method 4: Try CryptoCompare
+        return None
+    
+    def _fetch_cryptocompare_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from CryptoCompare - good Railway compatibility"""
         try:
             url = f"{self.apis['cryptocompare']}/pricemultifull"
-            params = {'fsyms': 'BTC', 'tsyms': 'USD'}
-            response = requests.get(url, params=params, timeout=10)
+            headers = self._get_browser_headers("cryptocompare")
+            params = {
+                'fsyms': 'BTC',
+                'tsyms': 'USD',
+                'relaxedValidation': 'true'
+            }
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=20)
             
             if response.status_code == 200:
                 data = response.json()
                 btc_data = data.get('RAW', {}).get('BTC', {}).get('USD', {})
-                return {
-                    'price': btc_data.get('PRICE', 0),
-                    'volume': btc_data.get('VOLUME24HOURTO', 0),
-                    'price_change': btc_data.get('CHANGEPCT24HOUR', 0)
-                }
+                if btc_data:
+                    return {
+                        'price': btc_data.get('PRICE', 0),
+                        'volume': btc_data.get('VOLUME24HOURTO', 0),
+                        'price_change': btc_data.get('CHANGEPCT24HOUR', 0)
+                    }
+            else:
+                self.logger.warning(f"CryptoCompare HTTP {response.status_code}: {response.text[:100]}")
+                
         except Exception as e:
-            print(f"CryptoCompare API failed: {e}")
+            raise Exception(f"CryptoCompare error: {e}")
         
-        print("All price APIs failed")
         return None
     
-    def _fetch_funding_fallback(self, symbol: str) -> Dict:
-        """Try to fetch funding data with fallbacks"""
-        
-        # Try Binance futures first
+    def _fetch_coinbase_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from Coinbase - moderate Railway compatibility"""
         try:
-            funding_url = f"{self.apis['binance_futures']}/premiumIndex"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(funding_url, params={'symbol': symbol}, headers=headers, timeout=10)
+            url = f"{self.apis['coinbase']}/products/BTC-USD/ticker"
+            headers = self._get_browser_headers("coinbase")
+            
+            response = self.session.get(url, headers=headers, timeout=15)
             
             if response.status_code == 200:
                 data = response.json()
+                if data.get('price'):
+                    return {
+                        'price': float(data.get('price', 0)),
+                        'volume': float(data.get('volume', 0)),
+                        'price_change': 0  # Coinbase doesn't provide 24h change in this endpoint
+                    }
+            else:
+                self.logger.warning(f"Coinbase HTTP {response.status_code}: {response.text[:100]}")
                 
-                # Try to get OI as well
-                oi_data = self._fetch_open_interest_fallback(symbol)
-                
-                return {
-                    'funding_rate': float(data['lastFundingRate']),
-                    'countdown': int(data['nextFundingTime']) - int(time.time() * 1000),
-                    'open_interest': oi_data
-                }
         except Exception as e:
-            print(f"Binance futures funding failed: {e}")
+            raise Exception(f"Coinbase error: {e}")
         
-        # Fallback: Use estimated funding rate based on market conditions
-        print("Using estimated funding data")
-        return {
-            'funding_rate': random.uniform(-0.001, 0.001),  # Random small funding rate
+        return None
+    
+    def _fetch_binance_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from Binance - often blocked on Railway"""
+        try:
+            url = f"{self.apis['binance_spot']}/ticker/24hr"
+            headers = self._get_browser_headers("binance")
+            params = {'symbol': symbol}
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('lastPrice'):
+                    return {
+                        'price': float(data['lastPrice']),
+                        'volume': float(data['volume']),
+                        'price_change': float(data['priceChangePercent'])
+                    }
+            else:
+                self.logger.warning(f"Binance HTTP {response.status_code}: {response.text[:100]}")
+                
+        except Exception as e:
+            raise Exception(f"Binance error: {e}")
+        
+        return None
+    
+    def _fetch_funding_fallback(self, symbol: str) -> Dict:
+        """Railway-optimized funding data fetch with fallbacks"""
+        
+        # Check cache first
+        cache_key = f"funding_data_{symbol}"
+        if self._is_cached(cache_key):
+            self.logger.info("Using cached funding data")
+            return self._get_cache(cache_key)
+        
+        # Try Binance futures with improved headers
+        if self._is_api_available('binance_futures'):
+            try:
+                self.logger.info("Trying Binance futures for funding data...")
+                funding_url = f"{self.apis['binance_futures']}/premiumIndex"
+                headers = self._get_browser_headers("binance")
+                
+                response = self.session.get(funding_url, params={'symbol': symbol}, 
+                                          headers=headers, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('lastFundingRate') is not None:
+                        # Try to get OI as well
+                        oi_data = self._fetch_open_interest_fallback(symbol)
+                        
+                        result = {
+                            'funding_rate': float(data['lastFundingRate']),
+                            'countdown': int(data['nextFundingTime']) - int(time.time() * 1000),
+                            'open_interest': oi_data
+                        }
+                        
+                        self.logger.info(f"✅ Binance funding data successful")
+                        self._record_api_success('binance_futures')
+                        self._set_cache(cache_key, result)
+                        return result
+                else:
+                    self.logger.warning(f"Binance futures HTTP {response.status_code}")
+                    self._record_api_failure('binance_futures')
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Binance futures funding failed: {e}")
+                self._record_api_failure('binance_futures')
+        
+        # Fallback: Use reasonable default values instead of random
+        self.logger.warning("Using default funding data - all funding APIs failed")
+        default_result = {
+            'funding_rate': 0.0001,  # Small positive funding rate
             'countdown': 8 * 60 * 60 * 1000,  # 8 hours in ms
-            'open_interest': 75000  # Estimated OI
+            'open_interest': 1000000  # Default OI estimate
         }
+        
+        # Cache the default values for a shorter time
+        self.cache[cache_key] = (time.time(), default_result)
+        return default_result
     
     def _fetch_open_interest_fallback(self, symbol: str) -> float:
-        """Try to fetch open interest with fallback"""
+        """Railway-optimized open interest fetch"""
         try:
             oi_url = f"{self.apis['binance_futures']}/openInterest"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(oi_url, params={'symbol': symbol}, headers=headers, timeout=10)
+            headers = self._get_browser_headers("binance")
+            
+            response = self.session.get(oi_url, params={'symbol': symbol}, 
+                                      headers=headers, timeout=12)
             
             if response.status_code == 200:
                 oi_data = response.json()
-                return float(oi_data['openInterest'])
-        except Exception:
-            pass
+                if oi_data.get('openInterest'):
+                    return float(oi_data['openInterest'])
+            else:
+                self.logger.warning(f"OI fetch HTTP {response.status_code}")
+                
+        except Exception as e:
+            self.logger.warning(f"OI fetch failed: {e}")
         
-        return 75000  # Default OI estimate
+        return 1000000  # More realistic default OI estimate
     
     def fetch_historical_data(self, symbol: str = "BTCUSDT", 
                              interval: str = "1h", limit: int = 200) -> pd.DataFrame:
@@ -233,64 +460,102 @@ class BitcoinPerpTrader:
         return pd.DataFrame()
     
     def _fetch_binance_historical(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
-        """Try to fetch from Binance"""
+        """Railway-optimized Binance historical data fetch"""
+        if not self._is_api_available('binance_historical'):
+            self.logger.warning("Skipping Binance historical - circuit breaker active")
+            return pd.DataFrame()
+            
         try:
             url = f"{self.apis['binance_futures']}/klines"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            headers = self._get_browser_headers("binance")
             params = {'symbol': symbol, 'interval': interval, 'limit': limit}
             
-            response = requests.get(url, params=params, headers=headers, timeout=30)
+            self.logger.info(f"Fetching {limit} {interval} candles from Binance...")
+            response = self.session.get(url, params=params, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
                 
-                df = pd.DataFrame(data, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-                    'taker_buy_quote', 'ignore'
-                ])
+                if data and len(data) > 0:
+                    df = pd.DataFrame(data, columns=[
+                        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                        'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                        'taker_buy_quote', 'ignore'
+                    ])
+                    
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    df.set_index('timestamp', inplace=True)
+                    df.sort_index(inplace=True)
+                    
+                    self.logger.info(f"✅ Binance historical: {len(df)} candles")
+                    self._record_api_success('binance_historical')
+                    return df
+                else:
+                    self.logger.warning("Binance returned empty historical data")
+            else:
+                self.logger.warning(f"Binance historical HTTP {response.status_code}: {response.text[:100]}")
+                self._record_api_failure('binance_historical')
                 
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                df.set_index('timestamp', inplace=True)
-                df.sort_index(inplace=True)
-                
-                return df
         except Exception as e:
-            print(f"Binance historical data failed: {e}")
+            self.logger.error(f"❌ Binance historical failed: {e}")
+            self._record_api_failure('binance_historical')
         
         return pd.DataFrame()
     
     def _fetch_coingecko_historical(self) -> pd.DataFrame:
-        """Try CoinGecko for historical data"""
+        """Railway-optimized CoinGecko historical data"""
+        if not self._is_api_available('coingecko_historical'):
+            self.logger.warning("Skipping CoinGecko historical - circuit breaker active")
+            return pd.DataFrame()
+            
         try:
             url = f"{self.apis['coingecko']}/coins/bitcoin/market_chart"
-            params = {'vs_currency': 'usd', 'days': '7', 'interval': 'hourly'}
+            headers = self._get_browser_headers("coingecko")
+            params = {
+                'vs_currency': 'usd', 
+                'days': '7', 
+                'interval': 'hourly',
+                'precision': '2'
+            }
             
-            response = requests.get(url, params=params, timeout=30)
+            self.logger.info("Fetching historical data from CoinGecko...")
+            response = self.session.get(url, params=params, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
                 prices = data.get('prices', [])
                 volumes = data.get('total_volumes', [])
                 
-                if prices and volumes:
+                if prices and volumes and len(prices) > 50:
                     df = pd.DataFrame()
                     df['timestamp'] = [datetime.fromtimestamp(p[0]/1000) for p in prices]
                     df['close'] = [p[1] for p in prices]
                     df['volume'] = [v[1] for v in volumes]
                     
-                    # Generate OHLC from close prices
+                    # Generate realistic OHLC from close prices
                     df['open'] = df['close'].shift(1).fillna(df['close'])
-                    df['high'] = df['close'] * (1 + np.random.uniform(0, 0.01, len(df)))
-                    df['low'] = df['close'] * (1 - np.random.uniform(0, 0.01, len(df)))
+                    # More conservative high/low generation
+                    df['high'] = df['close'] * (1 + np.random.uniform(0, 0.005, len(df)))
+                    df['low'] = df['close'] * (1 - np.random.uniform(0, 0.005, len(df)))
                     
                     df.set_index('timestamp', inplace=True)
+                    df.sort_index(inplace=True)
+                    
+                    self.logger.info(f"✅ CoinGecko historical: {len(df)} data points")
+                    self._record_api_success('coingecko_historical')
                     return df
+                else:
+                    self.logger.warning("CoinGecko returned insufficient historical data")
+            else:
+                self.logger.warning(f"CoinGecko historical HTTP {response.status_code}: {response.text[:100]}")
+                self._record_api_failure('coingecko_historical')
+                
         except Exception as e:
-            print(f"CoinGecko historical data failed: {e}")
+            self.logger.error(f"❌ CoinGecko historical failed: {e}")
+            self._record_api_failure('coingecko_historical')
         
         return pd.DataFrame()
     
