@@ -6,6 +6,7 @@ Telegram bot that provides Bitcoin perpetual futures analysis on demand
 
 import asyncio
 import logging
+import os
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
@@ -13,6 +14,14 @@ import io
 import sys
 from datetime import datetime
 import traceback
+
+# Load environment variables from .env file for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv not installed, skip (Railway loads env vars automatically)
+    pass
 
 # Import our trading system
 from bitcoin_perp_trader import BitcoinPerpTrader
@@ -372,18 +381,23 @@ Type `/analysis` for complete trading analysis!
 def main():
     """Main function to run the bot"""
     
-    # Bot token - You need to get this from @BotFather on Telegram
-    BOT_TOKEN = "8150860136:AAGzGz4ohH7GVu038SV4Gm3fHRlC1pbq52s"
+    # Get bot token from environment variable
+    BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Please set your bot token!")
-        print("\n📋 To get a bot token:")
-        print("1. Message @BotFather on Telegram")
-        print("2. Send /newbot")
-        print("3. Choose a name for your bot")
-        print("4. Choose a username (must end with 'bot')")
-        print("5. Copy the token and replace 'YOUR_BOT_TOKEN_HERE' in this script")
-        print("\n🔧 Then run: python3 telegram_bot.py")
+    if not BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
+        print("\n📋 To set your bot token:")
+        print("1. Get a token from @BotFather on Telegram:")
+        print("   - Message @BotFather")
+        print("   - Send /newbot")
+        print("   - Choose a name and username for your bot")
+        print("   - Copy the token")
+        print("\n2. Set the environment variable:")
+        print("   export TELEGRAM_BOT_TOKEN='your_token_here'")
+        print("   # OR for Windows:")
+        print("   set TELEGRAM_BOT_TOKEN=your_token_here")
+        print("\n3. Then run: python3 telegram_bot.py")
+        print("\n🔒 This keeps your token secure and out of the code!")
         return
     
     # Create and run bot

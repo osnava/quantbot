@@ -228,9 +228,9 @@ class BitcoinPerpTrader:
         if not df.empty:
             return df
         
-        # Method 3: Generate synthetic data for analysis
-        print("Using synthetic data for analysis")
-        return self._generate_synthetic_data(limit)
+        # No synthetic data - return empty DataFrame if all APIs fail
+        print("❌ All historical data APIs failed - cannot generate reliable analysis")
+        return pd.DataFrame()
     
     def _fetch_binance_historical(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
         """Try to fetch from Binance"""
@@ -344,7 +344,9 @@ class BitcoinPerpTrader:
         if df.empty or len(df) < 50:
             return self._create_hold_signal("Insufficient data", market_data.price)
         
-        current_price = df['close'].iloc[-1]
+        # Use real-time market price for entry calculations, not historical data
+        current_price = market_data.price
+        df_price = df['close'].iloc[-1]  # Use for technical analysis only
         
         # Bollinger Bands
         bb_period = 20
@@ -361,15 +363,15 @@ class BitcoinPerpTrader:
         avg_volume = df['volume'].rolling(window=24).mean().iloc[-1]
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
         
-        # Momentum calculations
-        momentum_1h = (current_price / df['close'].iloc[-2] - 1) if len(df) > 1 else 0
-        momentum_4h = (current_price / df['close'].iloc[-5] - 1) if len(df) > 4 else 0
-        momentum_12h = (current_price / df['close'].iloc[-13] - 1) if len(df) > 12 else 0
+        # Momentum calculations using historical data
+        momentum_1h = (df_price / df['close'].iloc[-2] - 1) if len(df) > 1 else 0
+        momentum_4h = (df_price / df['close'].iloc[-5] - 1) if len(df) > 4 else 0
+        momentum_12h = (df_price / df['close'].iloc[-13] - 1) if len(df) > 12 else 0
         
         signals = []
         reasoning = []
         
-        # Bollinger Band breakout
+        # Bollinger Band breakout (use market price for current analysis)
         if current_price > df['bb_upper'].iloc[-1]:
             signals.append(0.7)
             reasoning.append(f"Price broke above Bollinger upper: ${df['bb_upper'].iloc[-1]:,.2f}")
@@ -422,9 +424,11 @@ class BitcoinPerpTrader:
         if df.empty or len(df) < 100:
             return self._create_hold_signal("Insufficient data for mean reversion", market_data.price)
         
-        current_price = df['close'].iloc[-1]
+        # Use real-time market price for entry calculations
+        current_price = market_data.price
+        df_price = df['close'].iloc[-1]  # For technical analysis
         
-        # Statistical measures
+        # Statistical measures (use historical data for mean/std, current price for z-score)
         price_mean_24h = df['close'].rolling(window=24).mean().iloc[-1]
         price_std_24h = df['close'].rolling(window=24).std().iloc[-1]
         z_score = (current_price - price_mean_24h) / price_std_24h if price_std_24h > 0 else 0
@@ -433,7 +437,7 @@ class BitcoinPerpTrader:
         df['rsi'] = self.calculate_rsi(df['close'], 14)
         current_rsi = df['rsi'].iloc[-1]
         
-        # Bollinger position
+        # Bollinger position (use current market price)
         df['bb_middle'] = df['close'].rolling(window=20).mean()
         df['bb_upper'] = df['bb_middle'] + (df['close'].rolling(window=20).std() * 2)
         df['bb_lower'] = df['bb_middle'] - (df['close'].rolling(window=20).std() * 2)
@@ -526,7 +530,8 @@ class BitcoinPerpTrader:
         if df.empty or len(df) < 50:
             return self._create_hold_signal("Insufficient data for liquidation analysis", market_data.price)
         
-        current_price = df['close'].iloc[-1]
+        # Use real-time market price for entry calculations
+        current_price = market_data.price
         
         # Estimate liquidation levels
         liquidation_levels = self._estimate_liquidation_levels(current_price)
@@ -711,7 +716,10 @@ class BitcoinPerpTrader:
             df = self.fetch_historical_data(interval='1h', limit=200)
             
             if df.empty:
-                print("Failed to fetch historical data")
+                print("❌ Failed to fetch historical data - cannot perform technical analysis")
+                print("📊 Only basic price data available:")
+                print(f"   Current Price: ${market_data.price:,.2f}")
+                print(f"   Funding Rate: {market_data.funding_rate:.6f} ({market_data.funding_rate*365*3*100:.1f}% annually)")
                 return None
             
             self.price_data = df
