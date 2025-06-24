@@ -218,13 +218,33 @@ Type `/analysis` for complete trading analysis!
             
             try:
                 # Run the analysis
-                strategies, market_data = self.trader.run_analysis()
+                result = self.trader.run_analysis()
                 
                 # Get captured output
                 captured_text = captured_output.getvalue()
                 
                 # Restore stdout
                 sys.stdout = old_stdout
+                
+                # Check if we got valid results
+                if not result or len(result) != 2:
+                    await update.message.reply_text(
+                        "⚠️ Failed to fetch market data. This could be due to:\n"
+                        "• API connectivity issues\n"
+                        "• Market data unavailable\n"
+                        "• Network problems\n\n"
+                        "Please try again in a few moments."
+                    )
+                    return
+                
+                strategies, market_data = result
+                
+                # Validate data
+                if not strategies or not market_data:
+                    await update.message.reply_text(
+                        "⚠️ Incomplete market data received. Please try again."
+                    )
+                    return
                 
                 # Format the analysis for Telegram
                 telegram_message = self.format_analysis_for_telegram(strategies, market_data)

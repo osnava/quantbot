@@ -526,32 +526,37 @@ class BitcoinPerpTrader:
             timestamp=datetime.now()
         )
     
-    def run_analysis(self) -> Dict[str, TradingSignal]:
+    def run_analysis(self) -> tuple:
         """Run complete analysis with all strategies"""
-        print("Fetching market data...")
-        market_data = self.fetch_perpetual_data()
-        
-        if not market_data:
-            print("Failed to fetch market data")
-            return {}
-        
-        print("Fetching historical data...")
-        df = self.fetch_historical_data(interval='1h', limit=200)
-        
-        if df.empty:
-            print("Failed to fetch historical data")
-            return {}
-        
-        self.price_data = df
-        
-        print("Running strategies...")
-        strategies = {}
-        strategies['momentum'] = self.momentum_breakout_strategy(df, market_data)
-        strategies['mean_reversion'] = self.mean_reversion_strategy(df, market_data)
-        strategies['funding_arbitrage'] = self.funding_arbitrage_strategy(df, market_data)
-        strategies['liquidation_hunt'] = self.liquidation_hunt_strategy(df, market_data)
-        
-        return strategies, market_data
+        try:
+            print("Fetching market data...")
+            market_data = self.fetch_perpetual_data()
+            
+            if not market_data:
+                print("Failed to fetch market data")
+                return None
+            
+            print("Fetching historical data...")
+            df = self.fetch_historical_data(interval='1h', limit=200)
+            
+            if df.empty:
+                print("Failed to fetch historical data")
+                return None
+            
+            self.price_data = df
+            
+            print("Running strategies...")
+            strategies = {}
+            strategies['momentum'] = self.momentum_breakout_strategy(df, market_data)
+            strategies['mean_reversion'] = self.mean_reversion_strategy(df, market_data)
+            strategies['funding_arbitrage'] = self.funding_arbitrage_strategy(df, market_data)
+            strategies['liquidation_hunt'] = self.liquidation_hunt_strategy(df, market_data)
+            
+            return strategies, market_data
+            
+        except Exception as e:
+            print(f"Error in run_analysis: {e}")
+            return None
     
     def select_best_strategy(self, strategies: Dict[str, TradingSignal]) -> TradingSignal:
         """Select best strategy"""
@@ -636,8 +641,12 @@ def main():
     trader = BitcoinPerpTrader(initial_capital=10000)
     
     try:
-        strategies, market_data = trader.run_analysis()
-        trader.print_analysis(strategies, market_data)
+        result = trader.run_analysis()
+        if result:
+            strategies, market_data = result
+            trader.print_analysis(strategies, market_data)
+        else:
+            print("Failed to run analysis - no data available")
         
     except Exception as e:
         print(f"Error: {e}")
