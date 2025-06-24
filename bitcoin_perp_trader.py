@@ -50,13 +50,17 @@ class TradingSignal:
 
 class BitcoinPerpTrader:
     def __init__(self, initial_capital: float = 10000):
-        # Multiple API endpoints for redundancy
+        # Multiple API endpoints for redundancy - optimized for cloud deployment
         self.apis = {
             'binance_spot': "https://api.binance.com/api/v3",
             'binance_futures': "https://fapi.binance.com/fapi/v1", 
             'coingecko': "https://api.coingecko.com/api/v3",
             'coinbase': "https://api.exchange.coinbase.com",
-            'cryptocompare': "https://min-api.cryptocompare.com/data"
+            'cryptocompare': "https://min-api.cryptocompare.com/data",
+            # Geographic-restriction-free alternatives
+            'coinpaprika': "https://api.coinpaprika.com/v1",
+            'coincap': "https://api.coincap.io/v2",
+            'kraken': "https://api.kraken.com/0/public"
         }
         
         # Portfolio settings
@@ -136,6 +140,22 @@ class BitcoinPerpTrader:
                 'Origin': 'https://www.coingecko.com',
                 'Referer': 'https://www.coingecko.com/'
             })
+        elif api_name == "coincap":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+                'Authorization': 'Bearer'  # CoinCap doesn't require auth for basic endpoints
+            })
+        elif api_name == "coinpaprika":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json'
+            })
+        elif api_name == "kraken":
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json'
+            })
         else:
             base_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         
@@ -184,6 +204,38 @@ class BitcoinPerpTrader:
         """Record API success and reset failure count"""
         if api_name in self.failed_apis:
             del self.failed_apis[api_name]
+    
+    def _is_geographic_restriction(self, response_text: str, status_code: int) -> bool:
+        """Detect if API failure is due to geographic restrictions"""
+        geo_indicators = [
+            "restricted location",
+            "service unavailable",
+            "not available in your country",
+            "geographic restriction",
+            "region not supported",
+            "access denied",
+            "forbidden",
+            "eligibility",
+            "compliance",
+            "regulatory"
+        ]
+        
+        if status_code in [401, 403, 451]:  # Common geo-restriction codes
+            return True
+            
+        if response_text:
+            text_lower = response_text.lower()
+            return any(indicator in text_lower for indicator in geo_indicators)
+        
+        return False
+    
+    def _handle_geographic_restriction(self, api_name: str, response_text: str):
+        """Handle geographic restrictions by marking API as permanently failed"""
+        self.logger.warning(f"🌍 Geographic restriction detected for {api_name}")
+        self.logger.warning(f"   Response: {response_text[:200]}")
+        
+        # Mark as failed for longer period for geo restrictions
+        self.failed_apis[api_name] = (999, time.time())  # High failure count = long cooldown
         
     def fetch_perpetual_data(self, symbol: str = "BTCUSDT") -> Optional[PerpetualMarketData]:
         """Fetch comprehensive perpetual futures data with multiple fallbacks"""
@@ -220,12 +272,15 @@ class BitcoinPerpTrader:
             self.logger.info("Using cached price data")
             return self._get_cache(cache_key)
         
-        # Try APIs in order of Railway compatibility
+        # Try APIs in order of geographic restriction friendliness for Railway
         apis_to_try = [
-            ('coingecko', self._fetch_coingecko_price),
-            ('cryptocompare', self._fetch_cryptocompare_price),
-            ('coinbase', self._fetch_coinbase_price),
-            ('binance', self._fetch_binance_price)
+            ('coinpaprika', self._fetch_coinpaprika_price),   # Most reliable for cloud
+            ('kraken', self._fetch_kraken_price),             # Good cloud compatibility
+            ('coinbase', self._fetch_coinbase_price),         # Moderate restrictions
+            ('cryptocompare', self._fetch_cryptocompare_price), # Sometimes blocked
+            ('coincap', self._fetch_coincap_price),           # Secondary option
+            ('coingecko', self._fetch_coingecko_price),      # Often geo-blocked
+            ('binance', self._fetch_binance_price)            # Frequently blocked on cloud
         ]
         
         for api_name, fetch_func in apis_to_try:
@@ -246,8 +301,15 @@ class BitcoinPerpTrader:
                     self._record_api_failure(api_name)
                     
             except Exception as e:
-                self.logger.error(f"❌ {api_name} API failed: {e}")
-                self._record_api_failure(api_name)
+                error_msg = str(e)
+                self.logger.error(f"❌ {api_name} API failed: {error_msg}")
+                
+                # Check for geographic restrictions
+                if "401" in error_msg or "403" in error_msg or self._is_geographic_restriction(error_msg, 0):
+                    self._handle_geographic_restriction(api_name, error_msg)
+                else:
+                    self._record_api_failure(api_name)
+                
                 time.sleep(0.5)  # Brief pause between API attempts
         
         self.logger.error("🚨 All price APIs failed")
@@ -362,6 +424,103 @@ class BitcoinPerpTrader:
                 
         except Exception as e:
             raise Exception(f"Binance error: {e}")
+        
+        return None
+    
+    def _fetch_coincap_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from CoinCap - most Railway/cloud-friendly"""
+        try:
+            url = f"{self.apis['coincap']}/assets/bitcoin"
+            headers = self._get_browser_headers("coincap")
+            
+            response = self.session.get(url, headers=headers, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                asset_data = data.get('data', {})
+                if asset_data:
+                    price = float(asset_data.get('priceUsd', 0))
+                    volume = float(asset_data.get('volumeUsd24Hr', 0))
+                    change = float(asset_data.get('changePercent24Hr', 0))
+                    
+                    return {
+                        'price': price,
+                        'volume': volume,
+                        'price_change': change
+                    }
+            else:
+                error_text = response.text[:200]
+                self.logger.warning(f"CoinCap HTTP {response.status_code}: {error_text}")
+                
+                # Check for geographic restrictions
+                if self._is_geographic_restriction(error_text, response.status_code):
+                    raise Exception(f"Geographic restriction: {error_text}")
+                
+        except Exception as e:
+            raise Exception(f"CoinCap error: {e}")
+        
+        return None
+    
+    def _fetch_coinpaprika_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from CoinPaprika - very cloud-friendly"""
+        try:
+            url = f"{self.apis['coinpaprika']}/tickers/btc-bitcoin"
+            headers = self._get_browser_headers("coinpaprika")
+            
+            response = self.session.get(url, headers=headers, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                quotes = data.get('quotes', {}).get('USD', {})
+                if quotes:
+                    return {
+                        'price': quotes.get('price', 0),
+                        'volume': quotes.get('volume_24h', 0),
+                        'price_change': quotes.get('percent_change_24h', 0)
+                    }
+            else:
+                error_text = response.text[:200]
+                self.logger.warning(f"CoinPaprika HTTP {response.status_code}: {error_text}")
+                
+                if self._is_geographic_restriction(error_text, response.status_code):
+                    raise Exception(f"Geographic restriction: {error_text}")
+                
+        except Exception as e:
+            raise Exception(f"CoinPaprika error: {e}")
+        
+        return None
+    
+    def _fetch_kraken_price(self, symbol: str) -> Optional[Dict]:
+        """Fetch from Kraken - good cloud compatibility"""
+        try:
+            url = f"{self.apis['kraken']}/Ticker"
+            headers = self._get_browser_headers("kraken")
+            params = {'pair': 'XBTUSD'}  # Kraken's BTC symbol
+            
+            response = self.session.get(url, params=params, headers=headers, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get('result', {})
+                btc_data = result.get('XXBTZUSD', {})
+                if btc_data:
+                    price = float(btc_data.get('c', [0])[0])  # Last trade price
+                    volume = float(btc_data.get('v', [0])[1])  # 24h volume
+                    
+                    return {
+                        'price': price,
+                        'volume': volume,
+                        'price_change': 0  # Kraken doesn't provide 24h change in this endpoint
+                    }
+            else:
+                error_text = response.text[:200]
+                self.logger.warning(f"Kraken HTTP {response.status_code}: {error_text}")
+                
+                if self._is_geographic_restriction(error_text, response.status_code):
+                    raise Exception(f"Geographic restriction: {error_text}")
+                
+        except Exception as e:
+            raise Exception(f"Kraken error: {e}")
         
         return None
     
